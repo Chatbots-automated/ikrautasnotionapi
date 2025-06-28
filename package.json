@@ -1,9 +1,9 @@
 {
   "name": "monday-notion-media-only",
   "version": "1.0.0",
+  "engines": { "node": ">=18" },
   "dependencies": {
     "@notionhq/client": "^2.2.0",
-    "node-fetch": "^3.3.2",
     "p-queue": "^7.1.0"
   }
 }
