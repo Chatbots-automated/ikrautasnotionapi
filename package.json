@@ -2,8 +2,10 @@
   "name": "monday-notion-media-only",
   "version": "1.0.0",
   "engines": { "node": ">=18" },
+
   "dependencies": {
-    "@notionhq/client": "^2.2.0",
-    "p-queue": "^7.1.0"
+    "@notionhq/client": "^2.2.0",     // CJS + ESM dual build
+    "node-fetch": "^2.6.7",           // last CJS release
+    "p-queue": "^6.6.2"               // last CJS release
   }
 }
