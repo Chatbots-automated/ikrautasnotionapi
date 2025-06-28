@@ -11,24 +11,30 @@ const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const notion = new Notion({ auth: NOTION_TOKEN });
 const queue  = new PQueue({ concurrency: 3 });      // 3 parallel downloads
 
-// quick & dirty MIME guesser
+// ── helpers ────────────────────────────────────────
 function mimeFromName(name) {
   const ext = path.extname(name).toLowerCase();
-  return ext === '.mp4'           ? 'video/mp4'
-       : ext === '.png'           ? 'image/png'
+  return ext === '.mp4'          ? 'video/mp4'
+       : ext === '.png'          ? 'image/png'
        : ext === '.jpg' || ext === '.jpeg'
-                                  ? 'image/jpeg'
-       : ext === '.pdf'           ? 'application/pdf'
+                                 ? 'image/jpeg'
+       : ext === '.pdf'          ? 'application/pdf'
        : 'application/octet-stream';
 }
 
-// ── helpers ────────────────────────────────────────
+// trims to 100 chars (Notion limit)
+function trimName(name) {
+  return name.length <= 100 ? name : name.slice(0, 97) + '...';
+}
+
 async function getItemAssets(id) {
   console.log(`[Monday] Fetch item ${id}`);
   const query = `query ($id:[ID!]) {
-    items(ids:$id) { assets { id name public_url file_size } }
+    items(ids:$id) {
+      assets { id name public_url file_size }
+    }
   }`;
-  const resp = await fetch('https://api.monday.com/v2', {
+  const resp  = await fetch('https://api.monday.com/v2', {
     method : 'POST',
     headers: { 'Content-Type':'application/json', Authorization: MONDAY },
     body   : JSON.stringify({ query, variables:{ id:[String(id)] } })
@@ -40,11 +46,10 @@ async function getItemAssets(id) {
   return assets;
 }
 
-async function uploadToNotion(buf, name) {
+async function uploadToNotion(buf, origName) {
+  const name = trimName(origName);
   const mime = mimeFromName(name);
-  console.log(`[Notion] Upload ${name} (${(buf.length/1e6).toFixed(2)} MB)`);
 
-  // 1️⃣  create file_upload
   const create = await fetch('https://api.notion.com/v1/file_uploads', {
     method : 'POST',
     headers : {
@@ -55,14 +60,13 @@ async function uploadToNotion(buf, name) {
     body: JSON.stringify({ mode:'single_part', filename:name, content_type:mime })
   }).then(r => r.json());
 
-  // 2️⃣  send binary
   await fetch(create.upload_url, {
     method : 'POST',
     headers: { 'Content-Type': mime },
     body   : buf
   });
 
-  return create.id;
+  return { id: create.id, name };
 }
 
 // ── handler ────────────────────────────────────────
@@ -81,23 +85,22 @@ module.exports = async (req, res) => {
 
     await Promise.all(assets.map(a => queue.add(async () => {
       console.log(`[DL] ${a.name}`);
-      // Node-18 fetch() → arrayBuffer()
       const resp = await fetch(a.public_url);
       const buf  = Buffer.from(await resp.arrayBuffer());
 
       if (buf.length <= 20 * 1024 * 1024) {
-        const fid = await uploadToNotion(buf, a.name);
-        newFiles.push({ name:a.name, type:'file_upload', file_upload:{ id:fid } });
+        const { id, name } = await uploadToNotion(buf, a.name);
+        newFiles.push({ name, type:'file_upload', file_upload:{ id } });
       } else {
-        console.log(`[Skip] ${a.name} >20 MB – keeping external link`);
-        newFiles.push({ name:a.name, type:'external', external:{ url:a.public_url } });
+        console.log(`[Skip] ${a.name} >20 MB – external link`);
+        newFiles.push({ name: trimName(a.name), type:'external', external:{ url:a.public_url } });
       }
     })));
 
-    // merge with any existing files
-    const page = await notion.pages.retrieve({ page_id: pageId });
-    const existing = page.properties.files?.files || [];
-    const merged   = [...existing, ...newFiles];
+    // merge with existing files
+    const page      = await notion.pages.retrieve({ page_id: pageId });
+    const existing  = page.properties.files?.files || [];
+    const merged    = [...existing, ...newFiles];
 
     await notion.pages.update({
       page_id: pageId,
