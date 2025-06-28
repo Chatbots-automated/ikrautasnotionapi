@@ -11,12 +11,14 @@ const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const notion = new Notion({ auth: NOTION_TOKEN });
 const queue  = new PQueue({ concurrency: 3 });      // 3 parallel downloads
 
-// quick & dirty mime guesser
+// quick & dirty MIME guesser
 function mimeFromName(name) {
   const ext = path.extname(name).toLowerCase();
-  return ext === '.mp4' ? 'video/mp4'
-       : ext === '.png' ? 'image/png'
-       : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+  return ext === '.mp4'           ? 'video/mp4'
+       : ext === '.png'           ? 'image/png'
+       : ext === '.jpg' || ext === '.jpeg'
+                                  ? 'image/jpeg'
+       : ext === '.pdf'           ? 'application/pdf'
        : 'application/octet-stream';
 }
 
@@ -24,9 +26,7 @@ function mimeFromName(name) {
 async function getItemAssets(id) {
   console.log(`[Monday] Fetch item ${id}`);
   const query = `query ($id:[ID!]) {
-    items(ids:$id) {
-      assets { id name public_url file_size }
-    }
+    items(ids:$id) { assets { id name public_url file_size } }
   }`;
   const resp = await fetch('https://api.monday.com/v2', {
     method : 'POST',
@@ -81,7 +81,9 @@ module.exports = async (req, res) => {
 
     await Promise.all(assets.map(a => queue.add(async () => {
       console.log(`[DL] ${a.name}`);
-      const buf = await fetch(a.public_url).then(r => r.buffer());
+      // Node-18 fetch() → arrayBuffer()
+      const resp = await fetch(a.public_url);
+      const buf  = Buffer.from(await resp.arrayBuffer());
 
       if (buf.length <= 20 * 1024 * 1024) {
         const fid = await uploadToNotion(buf, a.name);
