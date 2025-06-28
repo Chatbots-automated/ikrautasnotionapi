@@ -8,12 +8,13 @@ const DB_ID   = process.env.NOTION_DB!;
 const BOT_ID  = process.env.BOT_ID!;
 const MONDAY  = process.env.MONDAY_TOKEN!;
 
-// Rate-limit helpers
-const queue = new PQueue({ concurrency: 3 });          // 3 parallel fetches max
-const sleep = (ms:number)=>new Promise(r=>setTimeout(r,ms));
+// 3 parallel downloads/uploads at once
+const queue = new PQueue({ concurrency: 3 });
 
-/** get Monday item + assets */
-async function getMondayItem(itemId:number) {
+/* ─────────────────────────  HELPERS  ───────────────────────── */
+
+async function getMondayItem(itemId: number) {
+  console.log(`[Monday] fetching item ${itemId}`);
   const query = `query ($id:[Int]) {
     items(ids:$id) {
       name
@@ -22,87 +23,103 @@ async function getMondayItem(itemId:number) {
     }
   }`;
   const r = await fetch('https://api.monday.com/v2', {
-    method:'POST',
-    headers:{ 'Content-Type':'application/json', Authorization:MONDAY },
-    body: JSON.stringify({ query, variables:{ id:itemId } })
-  }).then(r=>r.json());
-  if (r.errors) throw new Error(r.errors[0].message);
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: MONDAY },
+    body: JSON.stringify({ query, variables: { id: itemId } })
+  }).then(r => r.json());
+
+  if (r.errors) throw new Error(`[Monday] GraphQL error: ${JSON.stringify(r.errors)}`);
+  console.log(`[Monday] item fetched, ${r.data.items[0].assets.length} asset(s)`);
   return r.data.items[0];
 }
 
-/** upload ≤20 MB file into Notion File Upload API */
-async function uploadToNotion(buf:Buffer, name:string, mime:string){
-  // step 1: create
+async function uploadToNotion(buf: Buffer, name: string, mime: string) {
+  console.log(`[Notion] create file_upload for ${name} (${(buf.length/1e6).toFixed(2)} MB)`);
   const create = await fetch('https://api.notion.com/v1/file_uploads', {
-    method:'POST',
-    headers:{
-      Authorization:`Bearer ${process.env.NOTION_TOKEN}`,
-      'Notion-Version':'2022-06-28',
-      'Content-Type':'application/json'
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.NOTION_TOKEN}`,
+      'Notion-Version': '2022-06-28',
+      'Content-Type': 'application/json'
     },
-    body: JSON.stringify({ mode:'single_part', filename:name, content_type:mime })
-  }).then(r=>r.json());
+    body: JSON.stringify({ mode: 'single_part', filename: name, content_type: mime })
+  }).then(r => r.json());
 
-  // step 2: send binary
-  await fetch(create.upload_url, { method:'POST', headers:{ 'Content-Type':mime }, body: buf });
+  console.log(`[Notion] upload_url received, sending binary …`);
+  await fetch(create.upload_url, { method: 'POST', headers: { 'Content-Type': mime }, body: buf });
+  console.log(`[Notion] upload complete, file_upload_id = ${create.id}`);
 
-  return create.id;            // return file_upload_id
+  return create.id; // file_upload_id
 }
 
-export default async function handler(req:VercelRequest,res:VercelResponse){
-  if(req.method!=='POST') return res.status(405).end('POST only');
-  const itemId = Number(req.body?.itemId);
-  if(!itemId) return res.status(400).json({ ok:false, msg:'itemId missing' });
+/* ─────────────────────────  MAIN  ───────────────────────── */
 
-  try{
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  console.log('=== Incoming request ===');
+  if (req.method !== 'POST') {
+    console.error('Wrong method');
+    return res.status(405).end('POST only');
+  }
+
+  const rawId = req.body?.itemId;
+  const itemId = Number(rawId);
+  if (!itemId || Number.isNaN(itemId)) {
+    console.error('itemId missing/invalid:', rawId);
+    return res.status(400).json({ ok: false, msg: 'itemId missing or invalid' });
+  }
+
+  try {
     /* 1 ── pull Monday data */
     const item = await getMondayItem(itemId);
+    const col = (id: string) => item.column_values.find((c: any) => c.id === id)?.text || '';
 
-    /* map a helper for column text */
-    const col = (id:string)=>item.column_values.find((c:any)=>c.id===id)?.text ?? '';
-
-    /* 2 ── fetch & transform every asset (dynamic) */
+    /* 2 ── process every asset, unlimited count */
     const files: any[] = [];
 
-    await Promise.all(item.assets.map(a => queue.add(async () =>{
-      // throttle: Monday S3 links sometimes 403 if hammered
-      const buf = await fetch(a.public_url).then(r=>r.buffer());
+    console.log(`[Assets] preparing ${item.assets.length} file(s) …`);
+    await Promise.all(
+      item.assets.map(a =>
+        queue.add(async () => {
+          console.log(`[DL] ${a.name} (${(a.file_size/1e6).toFixed(2)} MB) → downloading …`);
+          const resp = await fetch(a.public_url);
+          const buf  = await resp.buffer();
+          console.log(`[DL] ${a.name} done, ${(buf.length/1e6).toFixed(2)} MB`);
 
-      let notionFile;
-      if(buf.length <= 20*1024*1024){              // ≤20 MB
-        const fid = await uploadToNotion(buf, a.name, a.mimetype);
-        notionFile = { name:a.name, type:'file_upload', file_upload:{ id:fid } };
-      }else{
-        // big file stays external; still streams in Notion
-        notionFile = { name:a.name, type:'external', external:{ url:a.public_url } };
-      }
-      files.push(notionFile);
-      await sleep(200);                            // gentle on Monday CDN
-    })));
+          if (buf.length <= 20 * 1024 * 1024) {
+            const fid = await uploadToNotion(buf, a.name, a.mimetype);
+            files.push({ name: a.name, type: 'file_upload', file_upload: { id: fid } });
+          } else {
+            console.log(`[SkipUpload] ${a.name} >20 MB, keeping external`);
+            files.push({ name: a.name, type: 'external', external: { url: a.public_url } });
+          }
+        })
+      )
+    );
+    console.log(`[Assets] all assets processed, total attached = ${files.length}`);
 
-    /* 3 ── create Notion page with attachments */
+    /* 3 ── create the Notion page */
+    console.log('[Notion] creating page …');
     const page = await notion.pages.create({
-      parent:{ database_id:DB_ID },
-      properties:{
-        Title:   { title:[{ text:{ content:item.name } }] },
-        Adresas: { rich_text:[{ text:{ content: col('address') } }] },
-        Dates:   { date:{ start: col('date') } },
-        Status:  { status:{ name:'backlog' } },
-        People:  { people:[{ object:'user', id:BOT_ID }] },
-        files:   { files }                        // every photo/video
+      parent: { database_id: DB_ID },
+      properties: {
+        Title:   { title: [{ text: { content: item.name } }] },
+        Adresas: { rich_text: [{ text: { content: col('address') } }] },
+        Dates:   { date: { start: col('date') } },
+        Status:  { status: { name: 'backlog' } },
+        People:  { people: [{ object: 'user', id: BOT_ID }] },
+        files:   { files }
       },
-      // Optional: inline preview blocks
       children: files.map(f => ({
-        object:'block',
-        type:   f.name.match(/\.mp4$/i) ? 'video' : 'image',
-        ...(f.name.match(/\.mp4$/i)
-            ? { video: f } : { image: f })
+        object: 'block',
+        type: f.name.match(/\.mp4$/i) ? 'video' : 'image',
+        ...(f.name.match(/\.mp4$/i) ? { video: f } : { image: f })
       }))
     });
+    console.log(`[Notion] page created → ${page.url}`);
 
-    res.status(200).json({ ok:true, url:page.url, attachments:files.length });
-  }catch(err:any){
-    console.error(err);
-    res.status(500).json({ ok:false, error:err.message });
+    return res.status(200).json({ ok: true, url: page.url, attachments: files.length });
+  } catch (err: any) {
+    console.error('[ERROR]', err.message, err.stack);
+    return res.status(500).json({ ok: false, error: err.message });
   }
 }
