@@ -1,75 +1,64 @@
-/*  api/addMedia.js  – CommonJS, Node 18+  */
+/*  api/addMedia.js  – CommonJS, Node 18 on Vercel  */
 const { Client: Notion } = require('@notionhq/client');
 const PQueue             = require('p-queue').default;
 const path               = require('path');
 
-/* ── ENV ───────────────────────────────────────── */
+/* ── ENV ────────────────────────────────────────── */
 const { MONDAY_TOKEN, NOTION_TOKEN } = process.env;
 
-/* fetch() for Node 18 on Vercel */
+/* fetch() shim for Node 18  */
 const fetch = (...a) => import('node-fetch').then(m => m.default(...a));
 
-/* ── clients ───────────────────────────────────── */
+/* ── clients ────────────────────────────────────── */
 const notion = new Notion({ auth: NOTION_TOKEN });
-const queue  = new PQueue({ concurrency: 3 });           // polite parallelism
+const queue  = new PQueue({ concurrency: 3 });   // 3 parallel downloads
 
-/* ── helpers ───────────────────────────────────── */
-const mimeFromName = n => {
-  const ext = path.extname(n).toLowerCase();
-  return {
-    '.mp4' : 'video/mp4',
-    '.png' : 'image/png',
-    '.jpg' : 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.gif' : 'image/gif',
-    '.pdf' : 'application/pdf'
-  }[ext] || 'application/octet-stream';
-};
+/* ── helpers ────────────────────────────────────── */
+const isVideo  = name => path.extname(name).toLowerCase() === '.mp4';
+const isImage  = name =>
+  ['.jpg','.jpeg','.png','.gif','.webp','.tif','.tiff'].includes(
+    path.extname(name).toLowerCase()
+  );
+const trim100  = n => (n.length <= 100 ? n : n.slice(0,97) + '…');
 
-const trim = n => (n.length <= 100 ? n : n.slice(0, 97) + '…');
-
+/* pull Monday-com assets for a single item */
 async function mondayAssets(id) {
-  console.log(`[Monday] fetch assets for item ${id}`);
   const query = `
     query ($id:[ID!]) {
       items(ids:$id) { assets { id name public_url file_size } }
     }`;
   const r = await fetch('https://api.monday.com/v2', {
     method : 'POST',
-    headers: { 'Content-Type':'application/json', Authorization: MONDAY_TOKEN },
+    headers: {
+      'Content-Type' : 'application/json',
+      Authorization  : MONDAY_TOKEN
+    },
     body   : JSON.stringify({ query, variables:{ id:[String(id)] } })
   }).then(r => r.json());
 
   if (r.errors) throw Error(r.errors[0].message);
-  const list = r.data.items[0]?.assets || [];
-  console.log(`[Monday] ${list.length} asset(s) found`);
-  return list;
+  return r.data.items[0]?.assets || [];
 }
 
-async function upload(buf, name) {
-  const mime = mimeFromName(name);
-  const create = await fetch('https://api.notion.com/v1/file_uploads', {
-    method : 'POST',
-    headers : {
-      Authorization   : `Bearer ${NOTION_TOKEN}`,
-      'Notion-Version': '2022-06-28',
-      'Content-Type'  : 'application/json'
-    },
-    body: JSON.stringify({ mode:'single_part', filename:name, content_type:mime })
-  }).then(r => r.json());
+/* build the minimal block Notion expects for an external file */
+function blockForExternal(asset) {
+  const base = {
+    type    : 'external',
+    external: { url: asset.public_url }
+  };
 
-  if (create.object === 'error' || !create.upload_url) return null;
+  const blockType =
+    isVideo(asset.name) ? 'video' :
+    isImage(asset.name) ? 'image' : 'file';
 
-  await fetch(create.upload_url, {
-    method : 'POST',
-    headers: { 'Content-Type': mime },
-    body   : buf
-  });
-
-  return { id: create.id, name };
+  return {
+    object: 'block',
+    type  : blockType,
+    [blockType]: base
+  };
 }
 
-/* ── handler ───────────────────────────────────── */
+/* ── handler ────────────────────────────────────── */
 module.exports = async (req, res) => {
   if (req.method !== 'POST')
     return res.status(405).end('POST only');
@@ -79,36 +68,17 @@ module.exports = async (req, res) => {
     return res.status(400).json({ ok:false, msg:'itemId or pageId missing' });
 
   try {
-    const assets   = await mondayAssets(itemId);
+    console.log(`[Monday] fetching assets for item ${itemId}`);
+    const assets = await mondayAssets(itemId);
+
     const children = [];
+    await Promise.all(
+      assets.map(a => queue.add(async () => {
+        console.log(`[Link] ${a.name}`);
+        children.push(blockForExternal({ ...a, name: trim100(a.name) }));
+      }))
+    );
 
-    await Promise.all(assets.map(a => queue.add(async () => {
-      console.log(`[DL] ${a.name}`);
-      const buf = Buffer.from(await (await fetch(a.public_url)).arrayBuffer());
-
-      // try direct upload if ≤ 20 MB
-      if (buf.length <= 20 * 1024 * 1024) {
-        const up = await upload(buf, a.name);
-        if (up) {
-          children.push(blockForFile({
-            type       : 'file_upload',
-            file_upload: { id: up.id },
-            name       : up.name              // will be stripped in blockForFile()
-          }));
-          return;
-        }
-      }
-
-      // fallback – external link
-      console.log(`[External] ${a.name}`);
-      children.push(blockForFile({
-        type   : 'external',
-        external:{ url: a.public_url },
-        name   : trim(a.name)                // will be stripped in blockForFile()
-      }));
-    })));
-
-    // append every new block at once
     if (children.length) {
       await notion.blocks.children.append({
         block_id: pageId,
@@ -122,22 +92,3 @@ module.exports = async (req, res) => {
     res.status(500).json({ ok:false, error: err.message });
   }
 };
-
-/* ── build a Notion block from a file object ───── */
-function blockForFile(file) {
-  /* decide block type by extension */
-  const ext      = (file.name || '').toLowerCase();
-  const isVideo  = ext.endsWith('.mp4');
-  const isImage  = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.tif', '.tiff'].some(e => ext.endsWith(e));
-  const blockType = isVideo ? 'video' : isImage ? 'image' : 'file';
-
-  /* Notion media blocks forbid `name` and require correct sub-object */
-  const payload = { ...file };
-  delete payload.name;              // ⚡ strip forbidden field
-
-  return {
-    object: 'block',
-    type  : blockType,
-    [blockType]: payload            // image / video / file
-  };
-}
