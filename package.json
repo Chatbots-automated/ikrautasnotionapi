@@ -4,8 +4,8 @@
   "engines": { "node": ">=18" },
 
   "dependencies": {
-    "@notionhq/client": "^2.2.0",     // CJS + ESM dual build
-    "node-fetch": "^2.6.7",           // last CJS release
-    "p-queue": "^6.6.2"               // last CJS release
+    "@notionhq/client": "^2.2.0",     
+    "node-fetch": "^2.6.7",           
+    "p-queue": "^6.6.2"               
   }
 }
