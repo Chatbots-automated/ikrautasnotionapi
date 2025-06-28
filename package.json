@@ -1,10 +1,8 @@
 {
-  "name": "monday-to-notion-installer",
+  "name": "monday-notion-media-only",
   "version": "1.0.0",
   "type": "module",
-  "engines": {
-    "node": ">=18"
-  },
+  "engines": { "node": ">=18" },
   "dependencies": {
     "@notionhq/client": "^2.2.0",
     "node-fetch": "^3.3.2",
