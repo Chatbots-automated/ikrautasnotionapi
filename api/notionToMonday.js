@@ -35,8 +35,6 @@ module.exports = async (req, res) => {
   console.log('[Webhook] raw payload →', JSON.stringify(evt, null, 2));
 
   /* ── 1. URL-verification handshake ─────────────────────────────── */
-  /* Docs: Notion sends *either* type=url_verification with a challenge
-           OR a plain object that only contains { "challenge": "…" }.   */
   if (evt.type === 'url_verification' || evt.challenge) {
     const challenge = evt.challenge || evt.data?.challenge;
     console.log('[Webhook] answering challenge →', challenge);
@@ -102,20 +100,22 @@ module.exports = async (req, res) => {
 };
 
 /* ──────────────────────────────────────────────────────────────────── */
-/* Helper: find monday item whose URL column equals the Notion page   */
+/* Helper: find monday item whose URL column equals the Notion page */
 async function findMondayItem(url) {
   const query = `
-    query ($v:[String]) {
+    query ($v:[String]!) {                                   /* ← non-null list */
       items_page_by_column_values(
         board_id:${BOARD_ID},
         columns:[{column_id:"${URL_COL}", column_values:$v}],
         limit:1
-      ){ items{ id } }
+      ){
+        items { id }
+      }
     }`;
   const r = await fetch('https://api.monday.com/v2', {
     method :'POST',
     headers:{ 'Content-Type':'application/json', Authorization: MONDAY },
-    body   : JSON.stringify({ query, variables: { v:[url] } })
+    body   : JSON.stringify({ query, variables: { v: [url] } })
   }).then(r => r.json());
 
   if (r.errors) throw new Error(r.errors[0].message);
@@ -123,7 +123,7 @@ async function findMondayItem(url) {
 }
 
 /* ──────────────────────────────────────────────────────────────────── */
-/* Helper: push ONE media block from Notion into Monday “files” col    */
+/* Helper: push ONE media block from Notion into Monday “files” col */
 async function uploadToMonday(itemId, block) {
 
   /* 1. Resolve a one-hour download URL from the block -------------- */
@@ -139,7 +139,7 @@ async function uploadToMonday(itemId, block) {
   const filename = path.basename(new URL(url).pathname) || `${block.id}.bin`;
   const buf      = Buffer.from(await (await fetch(url)).arrayBuffer());
 
-  console.log(`      · dl ${filename}  ${(buf.length/1e6).toFixed(2)} MB`);
+  console.log(`      · dl ${filename}  ${(buf.length / 1e6).toFixed(2)} MB`);
 
   /* 2. Build multipart/form-data mutation -------------------------- */
   const form = new FormData();
