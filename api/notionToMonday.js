@@ -1,6 +1,4 @@
-/*  api/notionToMonday.js  – CommonJS, Node 18 on Vercel  */
-/*  “verbose” edition – lots of console.log() calls        */
-
+/*  api/notionToMonday.js  – verbose + extra diagnostics  */
 const { Client: Notion } = require('@notionhq/client');
 const PQueue   = require('p-queue').default;
 const FormData = require('form-data');
@@ -8,173 +6,134 @@ const path     = require('path');
 
 const notion   = new Notion({ auth: process.env.NOTION_TOKEN });
 const MONDAY   = process.env.MONDAY_TOKEN;
-const BOARD_ID = process.env.MONDAY_BOARD_ID;
-const URL_COL  = process.env.TEXT_COLUMN_ID;         // text_mksny6n5
-const FILE_COL = process.env.FILES_COLUMN_ID;        // files
+const BOARD_ID = Number(process.env.MONDAY_BOARD_ID);     // ← cast!
+const URL_COL  = process.env.TEXT_COLUMN_ID;              // text_mksny6n5
+const FILE_COL = process.env.FILES_COLUMN_ID;             // files
 const queue    = new PQueue({ concurrency: 3 });
+const fetch    = (...a) => import('node-fetch').then(m => m.default(...a));
 
-const fetch = (...a) => import('node-fetch').then(m => m.default(...a));
-
-/* De-dupe cache */
 const SEEN = new Set();
 
-/* Simple MIME map */
+/* tiny MIME helper */
 const mime = n => ({
-  '.mp4':'video/mp4', '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg',
-  '.gif':'image/gif', '.webp':'image/webp', '.pdf':'application/pdf'
+  '.mp4':'video/mp4','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg',
+  '.gif':'image/gif','.webp':'image/webp','.pdf':'application/pdf'
 }[path.extname(n).toLowerCase()] || 'application/octet-stream');
 
-/* ────────────────────────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────── */
 module.exports = async (req, res) => {
-  if (req.method === 'HEAD') return res.status(200).end();   // Notion warm-up
+  if (req.method === 'HEAD') return res.status(200).end();
   if (req.method !== 'POST')  return res.status(405).end('POST only');
 
-  console.log('───────────────────────────────────────────────');
-  console.log(`[Incoming] ${new Date().toISOString()}`);
+  console.log('\n────────── New webhook @', new Date().toISOString(), '──────────');
 
   const evt = req.body;
-  console.log('[Webhook] payload:', JSON.stringify(evt, null, 2));
-
-  /* URL-verification handshake */
   if (evt.type === 'url_verification' || evt.challenge)
     return res.status(200).json({ challenge: evt.challenge || evt.data?.challenge });
 
-  if (evt.type !== 'page.content_updated')
-    return res.status(200).end('ignored');
+  if (evt.type !== 'page.content_updated') return res.status(200).end('ignored');
 
   try {
-    /* 1️⃣  fetch page for canonical URL */
+    /* 1️⃣  canonical Notion URL */
     const pageId  = evt.entity.id;
-    const pageObj = await notion.pages.retrieve({ page_id: pageId });
-    const pageURL = pageObj.url;
-    console.log('[Step 1] page.id', pageId);
-    console.log('[Step 1] page.url', pageURL);
+    const { url: pageURL } = await notion.pages.retrieve({ page_id: pageId });
+    console.log('[Page] ', pageId, '→', pageURL);
 
-    if (!pageURL) throw new Error('no page.url');
-
-    /* 2️⃣  find Monday row by exact URL */
-    const itemId = await findMondayItem(pageURL);
+    /* 2️⃣  try exact match in Monday */
+    let itemId = await findMondayItem(pageURL, /*exact*/true);
     if (!itemId) {
-      console.log('[Step 2] no Monday item – abort');
-      return res.status(200).end('no monday row');
+      /* optional fallback: loose contains() */
+      itemId = await findMondayItem(pageURL, /*exact*/false);
     }
-    console.log('[Step 2] Monday item →', itemId);
+    if (!itemId) return res.status(200).end('no monday row');
 
-    /* 3️⃣  crawl blocks (depth 0-2, paginated) */
-    const mediaBlocks = [];
-    await crawlBlocks(pageId, 0, mediaBlocks);
-    console.log(`[Step 3] total media discovered (all levels) → ${mediaBlocks.length}`);
+    console.log('[Match] Monday item', itemId);
 
-    const fresh = mediaBlocks.filter(b => !SEEN.has(b.id));
+    /* 3️⃣  collect media (depth-2 walker) */
+    const media = [];
+    await crawl(pageId, 0, media);
+    const fresh = media.filter(b => !SEEN.has(b.id));
     fresh.forEach(b => SEEN.add(b.id));
-    console.log(`[Step 3] new (never sent) media → ${fresh.length}`);
-
+    console.log(`[Media] discovered=${media.length}  new=${fresh.length}`);
     if (!fresh.length) return res.status(200).end('nothing new');
 
-    /* 4️⃣  upload */
-    await Promise.all(
-      fresh.map(b => queue.add(() => uploadToMonday(itemId, b)))
-    );
-
-    res.status(200).json({ ok:true, added: fresh.length });
+    await Promise.all(fresh.map(b => queue.add(() => upload(itemId, b))));
+    res.status(200).json({ ok:true, added:fresh.length });
   } catch (err) {
     console.error('[Fatal]', err);
-    res.status(500).json({ ok:false, error: err.message });
+    res.status(500).json({ ok:false, error:err.message });
   }
 };
 
-/* ────────────────────────────────────────── */
-/* crawlBlocks – DFS with depth + pagination */
-async function crawlBlocks(blockId, depth, out) {
-  if (depth > 2) return;                 // hard stop
-
-  let cursor;
-  let page = 0;
+/* ── recursive crawl (≤ depth 2) ── */
+async function crawl(blockId, depth, out) {
+  if (depth > 2) return;
+  let cursor; let page = 0;
   do {
-    const { results, has_more, next_cursor } =
-      await notion.blocks.children.list({
-        block_id: blockId,
-        start_cursor: cursor,
-        page_size: 100
-      });
-
-    console.log(`[crawl] depth=${depth} page=${++page} children=${results.length}`);
-
+    const { results, next_cursor, has_more } =
+      await notion.blocks.children.list({ block_id:blockId, start_cursor:cursor, page_size:100 });
+    console.log(`[crawl] depth${depth} page${++page} children=${results.length}`);
     for (const b of results) {
       if (['image','video','file','pdf','audio'].includes(b.type)) out.push(b);
-      if (b.has_children) await crawlBlocks(b.id, depth + 1, out);
+      if (b.has_children) await crawl(b.id, depth+1, out);
     }
     cursor = has_more ? next_cursor : undefined;
   } while (cursor);
 }
 
-/* ────────────────────────────────────────── */
-/* findMondayItem – exact match on URL text  */
-async function findMondayItem(url) {
-  const query = `
-    query ($v:[String]!) {
+/* ── Monday lookup ── */
+async function findMondayItem(url, exact) {
+  const value   = exact ? url : url.toLowerCase();
+  const query   = `
+    query($v:[String!]!) {
       items_page_by_column_values(
         board_id:${BOARD_ID},
         columns:[{column_id:"${URL_COL}", column_values:$v}],
-        limit:1
-      ){ items { id name } }
+        limit:100
+      ){ items { id name column_values(ids:["${URL_COL}"]){ text } } }
     }`;
-
+  console.log('[GQL] board', BOARD_ID, 'column', URL_COL, 'looking for', value);
   const resp = await fetch('https://api.monday.com/v2', {
-    method :'POST',
-    headers:{ 'Content-Type':'application/json', Authorization: MONDAY },
-    body   : JSON.stringify({ query, variables:{ v:[url] } })
+    method:'POST',
+    headers:{ 'Content-Type':'application/json', Authorization:MONDAY },
+    body:JSON.stringify({ query, variables:{ v:[value] } })
   }).then(r => r.json());
 
-  if (resp.errors) {
-    console.error('[findMondayItem] GraphQL error:', resp.errors);
-    throw new Error(resp.errors[0].message);
-  }
+  if (resp.errors) { console.error('[GQL-error]', resp.errors); throw Error(resp.errors[0].message); }
 
-  const hit = resp.data.items_page_by_column_values.items[0];
-  if (!hit) {
-    console.log('[findMondayItem] no match for', url);
-    return null;
+  const hits = resp.data.items_page_by_column_values.items;
+  if (!hits.length) return null;
+
+  /* if loose search, return the first whose cell actually *contains* the full url */
+  if (!exact) {
+    const hit = hits.find(it => (it.column_values[0].text||'').toLowerCase().includes(value));
+    return hit?.id || null;
   }
-  console.log('[findMondayItem] match:', hit);
-  return hit.id;
+  return hits[0].id;
 }
 
-/* ────────────────────────────────────────── */
-/* uploadToMonday – single file to column    */
-async function uploadToMonday(itemId, block) {
+/* ── upload helper ── */
+async function upload(itemId, block) {
   const data = block[block.type];
-  const url  = data.file_upload?.id
-      ? await notion.fileUploads.retrieve({ file_upload_id: data.file_upload.id }).then(r => r.url)
+  const src  = data.file_upload?.id
+      ? await notion.fileUploads.retrieve({ file_upload_id:data.file_upload.id }).then(r=>r.url)
       : data.file?.url || data.external?.url;
 
-  if (!url) {
-    console.warn('[uploadToMonday] block w/o url', block.id);
-    return;
-  }
+  if (!src) { console.warn('[skip] no url on', block.id); return; }
 
-  const filename = path.basename(new URL(url).pathname) || `${block.id}.bin`;
-  const buf      = Buffer.from(await (await fetch(url)).arrayBuffer());
-  console.log(`[upload] ${filename} (${(buf.length/1e6).toFixed(2)} MB)`);
+  const filename = path.basename(new URL(src).pathname) || `${block.id}.bin`;
+  const buf      = Buffer.from(await (await fetch(src)).arrayBuffer());
+  console.log(`[upload] ${filename}  ${(buf.length/1e6).toFixed(2)} MB`);
 
   const form = new FormData();
-  form.append('query', `
-    mutation ($file: File!) {
-      add_file_to_column(item_id:${itemId}, column_id:"${FILE_COL}", file:$file){ id }
-    }`);
+  form.append('query',`mutation($file:File!){add_file_to_column(item_id:${itemId},column_id:"${FILE_COL}",file:$file){id}}`);
   form.append('variables', JSON.stringify({ file:null }));
-  form.append('file', buf, { filename, contentType: mime(filename) });
+  form.append('file', buf, { filename, contentType:mime(filename) });
 
-  const resp = await fetch('https://api.monday.com/v2/file', {
-    method :'POST',
-    headers:{ Authorization: MONDAY },
-    body   : form
-  }).then(r => r.json());
+  const r = await fetch('https://api.monday.com/v2/file', {
+    method:'POST', headers:{ Authorization:MONDAY }, body:form
+  }).then(r=>r.json());
 
-  if (resp.errors) {
-    console.error('[uploadToMonday] Monday error:', resp.errors);
-    throw new Error(resp.errors[0].message);
-  }
-
-  console.log(`[upload] ✔ ${filename} (asset ${resp.data.add_file_to_column.id})`);
+  if (r.errors){ console.error('[Monday-error]', r.errors); throw Error(r.errors[0].message); }
+  console.log(`[✓] ${filename} → asset ${r.data.add_file_to_column.id}`);
 }
